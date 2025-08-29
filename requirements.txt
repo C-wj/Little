@@ -1,0 +1,6 @@
+Flask
+python-docx
+markdownify
+flask-cors
+Werkzeug
+python-dotenv
