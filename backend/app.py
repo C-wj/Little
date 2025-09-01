@@ -29,13 +29,17 @@ def allowed_file(filename):
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def docx_to_markdown(docx_path):
+def docx_to_markdown(docx_path, config=None):
     """将docx文件转换为markdown格式"""
+    if config is None:
+        config = get_default_config()
+    
     try:
         # 读取docx文件
         doc = Document(docx_path)
         
         markdown_content = []
+        paragraph_index = 0
         
         # 按顺序处理文档中的所有元素
         for element in doc.element.body:
@@ -47,9 +51,10 @@ def docx_to_markdown(docx_path):
                         break
                 
                 if paragraph and paragraph.text.strip():
-                    md_text = convert_paragraph_to_markdown(paragraph)
+                    md_text = convert_paragraph_to_markdown(paragraph, paragraph_index, config)
                     if md_text:
                         markdown_content.append(md_text)
+                    paragraph_index += 1
             
             elif element.tag.endswith('tbl'):  # 表格
                 table = None
@@ -76,10 +81,25 @@ def docx_to_markdown(docx_path):
         raise Exception(f"转换过程中出现错误: {str(e)}")
 
 
-def convert_paragraph_to_markdown(paragraph):
+def get_default_config():
+    """获取默认配置"""
+    return {
+        'treat_first_page_as_metadata': True,  # 第一页作为元数据处理
+        'metadata_paragraph_limit': 10,  # 前N个段落可能是元数据
+        'auto_detect_headers': True,  # 自动检测标题
+        'exclude_table_headers_as_titles': True,  # 排除表格标题作为文档标题
+        'min_heading_length': 2,  # 标题最小长度
+        'max_heading_length': 80,  # 标题最大长度
+    }
+
+
+def convert_paragraph_to_markdown(paragraph, paragraph_index=0, config=None):
     """将段落转换为markdown格式"""
     if not paragraph.text.strip():
         return ''
+    
+    if config is None:
+        config = get_default_config()
     
     # 检查是否为标题
     style_name = paragraph.style.name.lower()
@@ -113,7 +133,7 @@ def convert_paragraph_to_markdown(paragraph):
             return f'{prefix} {text}'
     
     # 对于没有使用标题样式的文档，尝试根据格式和内容判断标题
-    if is_likely_heading(paragraph):
+    if config['auto_detect_headers'] and is_likely_heading(paragraph, paragraph_index, config):
         heading_level = detect_heading_level(paragraph)
         prefix = '#' * heading_level
         return f'{prefix} {text}'
@@ -122,22 +142,23 @@ def convert_paragraph_to_markdown(paragraph):
     return format_text_runs(paragraph)
 
 
-def is_likely_heading(paragraph):
+def is_likely_heading(paragraph, paragraph_index=0, config=None):
     """判断段落是否可能是标题"""
+    if config is None:
+        config = get_default_config()
+        
     text = paragraph.text.strip()
     
     # 空文本不是标题
     if not text:
         return False
     
-    # 排除明显的文档元数据
-    metadata_keywords = [
-        '资料编码', '文档版本', '发布日期', '版权所有', 'VOS3000', 'V2.1.9.07', 'Web 接口说明书',
-        '昆石网络技术有限公司', '05', '2022-10-19'
-    ]
-    
-    if any(keyword in text for keyword in metadata_keywords):
+    # 检查长度限制
+    if len(text) < config['min_heading_length'] or len(text) > config['max_heading_length']:
         return False
+    
+    # 前几个段落可能是文档元数据，需要更谨慎判断
+    is_early_paragraph = paragraph_index < config['metadata_paragraph_limit']
     
     # 检查是否整个段落都是粗体
     if paragraph.runs:
@@ -155,14 +176,55 @@ def is_likely_heading(paragraph):
             
         # 如果整个段落都是粗体，可能是标题
         if all_bold:
-            # 进一步判断：标题通常较短且不包含句号
-            if len(text) < 100 and not text.endswith('。') and not text.endswith('.'):
-                # 排除一些明显不是标题的内容
-                exclude_keywords = ['参数名称', '必须', '类型', '描述信息', 'retCode', 'exception']
-                if not any(keyword in text for keyword in exclude_keywords):
-                    return True
+            # 排除明显的表格标题
+            if config['exclude_table_headers_as_titles']:
+                table_keywords = ['参数名称', '必须', '类型', '描述信息', 'retCode', 'exception']
+                if any(keyword in text for keyword in table_keywords):
+                    return False
+            
+            # 对于前几个段落，使用更严格的标准
+            if is_early_paragraph:
+                return is_likely_document_title(text, paragraph_index)
+            else:
+                # 后面的段落使用宽松的标准
+                return (not text.endswith('。') and 
+                       not text.endswith('.') and
+                       not contains_complex_punctuation(text))
     
     return False
+
+
+def is_likely_document_title(text, paragraph_index):
+    """判断是否可能是文档标题（用于前几个段落的严格检查）"""
+    # 明显的章节标识
+    section_indicators = ['概述', '配置', '功能操作', '目录', '注意', '商标声明']
+    if any(indicator in text for indicator in section_indicators):
+        return True
+    
+    # 章节号格式
+    if len(text.split()) >= 2:
+        first_part = text.split()[0]
+        if first_part.isdigit() and int(first_part) <= 20:
+            return True
+    
+    # 数字编号格式 (如 "2.1", "3.2.1")
+    if '.' in text and len(text) <= 15:
+        parts = text.split('.')
+        if len(parts) <= 3 and all(part.strip().isdigit() for part in parts if part.strip()):
+            return True
+    
+    # 第一个段落如果很短且像标题，可能是文档标题
+    if paragraph_index == 0 and len(text) <= 30:
+        return True
+    
+    # 其他情况下，前几个段落比较可能是元数据
+    return False
+
+
+def contains_complex_punctuation(text):
+    """检查是否包含复杂标点符号（表明可能是正文而非标题）"""
+    complex_punct = ['，', '：', '；', '（', '）', '"', '"', '、']
+    return any(punct in text for punct in complex_punct)
 
 
 def detect_heading_level(paragraph):
@@ -253,6 +315,41 @@ def convert_table_to_markdown(table):
             table_md.append(separator)
     
     return table_md
+
+
+def get_conversion_config(request):
+    """从请求中获取转换配置"""
+    config = get_default_config()
+    
+    # 从表单数据中获取配置选项
+    if 'treat_first_page_as_metadata' in request.form:
+        config['treat_first_page_as_metadata'] = request.form.get('treat_first_page_as_metadata', 'true').lower() == 'true'
+    
+    if 'metadata_paragraph_limit' in request.form:
+        try:
+            config['metadata_paragraph_limit'] = int(request.form.get('metadata_paragraph_limit', '10'))
+        except ValueError:
+            pass
+    
+    if 'auto_detect_headers' in request.form:
+        config['auto_detect_headers'] = request.form.get('auto_detect_headers', 'true').lower() == 'true'
+    
+    if 'exclude_table_headers_as_titles' in request.form:
+        config['exclude_table_headers_as_titles'] = request.form.get('exclude_table_headers_as_titles', 'true').lower() == 'true'
+    
+    if 'min_heading_length' in request.form:
+        try:
+            config['min_heading_length'] = int(request.form.get('min_heading_length', '2'))
+        except ValueError:
+            pass
+    
+    if 'max_heading_length' in request.form:
+        try:
+            config['max_heading_length'] = int(request.form.get('max_heading_length', '80'))
+        except ValueError:
+            pass
+    
+    return config
 
 
 @app.route('/')
@@ -403,6 +500,62 @@ def index():
                 color: #721c24;
             }
             
+            .config-panel {
+                background: #f8f9ff;
+                border-radius: 15px;
+                padding: 20px;
+                margin: 20px 0;
+                border: 2px solid #e8ecff;
+            }
+            
+            .config-header {
+                color: #667eea;
+                font-weight: bold;
+                margin-bottom: 15px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }
+            
+            .config-content {
+                display: none;
+            }
+            
+            .config-content.show {
+                display: block;
+            }
+            
+            .config-row {
+                display: flex;
+                align-items: center;
+                margin-bottom: 10px;
+                flex-wrap: wrap;
+            }
+            
+            .config-label {
+                flex: 1;
+                min-width: 200px;
+                color: #555;
+                font-size: 0.9em;
+            }
+            
+            .config-input {
+                flex: 0 0 auto;
+                margin-left: 10px;
+            }
+            
+            .config-input input[type="checkbox"] {
+                transform: scale(1.2);
+            }
+            
+            .config-input input[type="number"] {
+                width: 80px;
+                padding: 5px;
+                border: 1px solid #ddd;
+                border-radius: 5px;
+            }
+            
             @media (max-width: 600px) {
                 .container {
                     margin: 10px;
@@ -411,6 +564,16 @@ def index():
                 
                 h1 {
                     font-size: 2em;
+                }
+                
+                .config-row {
+                    flex-direction: column;
+                    align-items: flex-start;
+                }
+                
+                .config-input {
+                    margin-left: 0;
+                    margin-top: 5px;
                 }
             }
         </style>
@@ -425,6 +588,45 @@ def index():
                 <div class="upload-text">点击或拖拽Word文档到这里</div>
                 <div style="color: #999; font-size: 0.9em;">支持 .docx 和 .doc 格式，最大16MB</div>
                 <input type="file" id="fileInput" class="file-input" accept=".docx,.doc" />
+            </div>
+            
+            <div class="config-panel">
+                <div class="config-header" onclick="toggleConfig()">
+                    <span>⚙️ 转换设置</span>
+                    <span id="configToggle">▼</span>
+                </div>
+                <div class="config-content" id="configContent">
+                    <div class="config-row">
+                        <div class="config-label">智能标题检测</div>
+                        <div class="config-input">
+                            <input type="checkbox" id="autoDetectHeaders" checked>
+                        </div>
+                    </div>
+                    <div class="config-row">
+                        <div class="config-label">排除表格标题</div>
+                        <div class="config-input">
+                            <input type="checkbox" id="excludeTableHeaders" checked>
+                        </div>
+                    </div>
+                    <div class="config-row">
+                        <div class="config-label">元数据段落限制（前N段作为元数据）</div>
+                        <div class="config-input">
+                            <input type="number" id="metadataLimit" value="10" min="0" max="50">
+                        </div>
+                    </div>
+                    <div class="config-row">
+                        <div class="config-label">标题最小长度</div>
+                        <div class="config-input">
+                            <input type="number" id="minHeadingLength" value="2" min="1" max="20">
+                        </div>
+                    </div>
+                    <div class="config-row">
+                        <div class="config-label">标题最大长度</div>
+                        <div class="config-input">
+                            <input type="number" id="maxHeadingLength" value="80" min="10" max="200">
+                        </div>
+                    </div>
+                </div>
             </div>
             
             <div class="progress" id="progress">
@@ -448,6 +650,31 @@ def index():
             const result = document.getElementById('result');
             const resultMessage = document.getElementById('resultMessage');
             const downloadLink = document.getElementById('downloadLink');
+
+            // 配置面板切换
+            function toggleConfig() {
+                const content = document.getElementById('configContent');
+                const toggle = document.getElementById('configToggle');
+                
+                if (content.classList.contains('show')) {
+                    content.classList.remove('show');
+                    toggle.textContent = '▼';
+                } else {
+                    content.classList.add('show');
+                    toggle.textContent = '▲';
+                }
+            }
+
+            // 获取转换配置
+            function getConversionConfig() {
+                return {
+                    auto_detect_headers: document.getElementById('autoDetectHeaders').checked,
+                    exclude_table_headers_as_titles: document.getElementById('excludeTableHeaders').checked,
+                    metadata_paragraph_limit: document.getElementById('metadataLimit').value,
+                    min_heading_length: document.getElementById('minHeadingLength').value,
+                    max_heading_length: document.getElementById('maxHeadingLength').value
+                };
+            }
 
             // 点击上传区域触发文件选择
             uploadArea.addEventListener('click', () => {
@@ -499,6 +726,12 @@ def index():
             function uploadFile(file) {
                 const formData = new FormData();
                 formData.append('file', file);
+                
+                // 添加配置参数
+                const config = getConversionConfig();
+                for (const [key, value] of Object.entries(config)) {
+                    formData.append(key, value);
+                }
 
                 // 显示进度条
                 progress.style.display = 'block';
@@ -586,8 +819,11 @@ def convert_word_to_markdown():
         file.save(filepath)
         
         try:
+            # 获取转换配置
+            config = get_conversion_config(request)
+            
             # 转换为Markdown
-            markdown_content = docx_to_markdown(filepath)
+            markdown_content = docx_to_markdown(filepath, config)
             
             # 创建临时文件用于下载
             with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as temp_file:
