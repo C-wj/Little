@@ -1,4 +1,5 @@
 import os
+import io
 import tempfile
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -7,6 +8,7 @@ from docx import Document
 import markdownify
 import zipfile
 from datetime import datetime
+from PIL import Image
 
 app = Flask(__name__)
 CORS(app)
@@ -14,6 +16,7 @@ CORS(app)
 # 配置
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'docx', 'doc'}
+ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'}
 MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -27,6 +30,132 @@ def allowed_file(filename):
     """检查文件扩展名是否允许"""
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def allowed_image_file(filename):
+    """检查图片文件扩展名是否允许"""
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
+
+
+def compress_image_to_size(image_data, target_size_kb, output_format='JPEG'):
+    """
+    将图片压缩到指定大小（KB）
+    使用二分法调整质量来逼近目标大小
+    """
+    target_size_bytes = target_size_kb * 1024
+    
+    # 打开图片
+    img = Image.open(io.BytesIO(image_data))
+    
+    # 如果是 RGBA 模式且要输出为 JPEG，转换为 RGB
+    if img.mode == 'RGBA' and output_format.upper() == 'JPEG':
+        # 创建白色背景
+        background = Image.new('RGB', img.size, (255, 255, 255))
+        background.paste(img, mask=img.split()[3])  # 使用 alpha 通道作为 mask
+        img = background
+    elif img.mode != 'RGB' and output_format.upper() == 'JPEG':
+        img = img.convert('RGB')
+    
+    # 先检查原图大小
+    original_buffer = io.BytesIO()
+    if output_format.upper() == 'PNG':
+        img.save(original_buffer, format='PNG', optimize=True)
+    else:
+        img.save(original_buffer, format='JPEG', quality=95)
+    original_size = original_buffer.tell()
+    
+    # 如果原图已经小于目标大小，直接返回
+    if original_size <= target_size_bytes:
+        original_buffer.seek(0)
+        return original_buffer.getvalue(), original_size, 100, False
+    
+    # 使用二分法查找合适的质量值
+    min_quality = 5
+    max_quality = 95
+    best_result = None
+    best_size = float('inf')
+    best_quality = min_quality
+    
+    # 同时考虑缩放图片
+    scale_factor = 1.0
+    current_img = img.copy()
+    
+    for _ in range(20):  # 最多迭代20次
+        quality = (min_quality + max_quality) // 2
+        
+        buffer = io.BytesIO()
+        if output_format.upper() == 'PNG':
+            # PNG 使用压缩级别而不是质量
+            current_img.save(buffer, format='PNG', optimize=True)
+        else:
+            current_img.save(buffer, format='JPEG', quality=quality, optimize=True)
+        
+        current_size = buffer.tell()
+        
+        if current_size <= target_size_bytes:
+            if current_size > best_size * 0.5 or best_result is None:  # 选择更接近目标的
+                best_result = buffer.getvalue()
+                best_size = current_size
+                best_quality = quality
+            min_quality = quality + 1
+        else:
+            max_quality = quality - 1
+        
+        if min_quality > max_quality:
+            break
+    
+    # 如果通过质量调整还是无法达到目标大小，需要缩放图片
+    if best_size > target_size_bytes:
+        # 计算需要的缩放比例
+        scale_factor = (target_size_bytes / best_size) ** 0.5
+        scale_factor = max(0.1, scale_factor)  # 最小缩放到 10%
+        
+        new_width = int(img.width * scale_factor)
+        new_height = int(img.height * scale_factor)
+        
+        if new_width > 0 and new_height > 0:
+            current_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            # 再次用二分法调整质量
+            min_quality = 5
+            max_quality = 95
+            
+            for _ in range(15):
+                quality = (min_quality + max_quality) // 2
+                
+                buffer = io.BytesIO()
+                if output_format.upper() == 'PNG':
+                    current_img.save(buffer, format='PNG', optimize=True)
+                else:
+                    current_img.save(buffer, format='JPEG', quality=quality, optimize=True)
+                
+                current_size = buffer.tell()
+                
+                if current_size <= target_size_bytes:
+                    best_result = buffer.getvalue()
+                    best_size = current_size
+                    best_quality = quality
+                    min_quality = quality + 1
+                else:
+                    max_quality = quality - 1
+                
+                if min_quality > max_quality:
+                    break
+    
+    if best_result is None:
+        # 如果还是没有结果，使用最低质量
+        buffer = io.BytesIO()
+        if output_format.upper() == 'PNG':
+            current_img.save(buffer, format='PNG', optimize=True)
+        else:
+            current_img.save(buffer, format='JPEG', quality=5, optimize=True)
+        best_result = buffer.getvalue()
+        best_size = buffer.tell()
+        best_quality = 5
+    
+    resized = scale_factor < 1.0
+    return best_result, best_size, best_quality, resized
 
 
 def docx_to_markdown(docx_path, config=None):
@@ -361,7 +490,7 @@ def index():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Word转Markdown工具</title>
+        <title>Little 小工具集</title>
         <style>
             * {
                 box-sizing: border-box;
@@ -384,26 +513,63 @@ def index():
                 border-radius: 20px;
                 padding: 40px;
                 box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-                max-width: 600px;
+                max-width: 650px;
                 width: 100%;
                 text-align: center;
             }
             
             h1 {
                 color: #333;
-                margin-bottom: 30px;
-                font-size: 2.5em;
+                margin-bottom: 20px;
+                font-size: 2.2em;
                 background: linear-gradient(135deg, #667eea, #764ba2);
                 -webkit-background-clip: text;
                 -webkit-text-fill-color: transparent;
                 background-clip: text;
             }
             
+            .tabs {
+                display: flex;
+                margin-bottom: 30px;
+                border-radius: 12px;
+                overflow: hidden;
+                background: #f0f3ff;
+            }
+            
+            .tab {
+                flex: 1;
+                padding: 15px 20px;
+                cursor: pointer;
+                font-weight: 600;
+                color: #667eea;
+                transition: all 0.3s ease;
+                border: none;
+                background: transparent;
+                font-size: 1em;
+            }
+            
+            .tab:hover {
+                background: rgba(102, 126, 234, 0.1);
+            }
+            
+            .tab.active {
+                background: linear-gradient(135deg, #667eea, #764ba2);
+                color: white;
+            }
+            
+            .tab-content {
+                display: none;
+            }
+            
+            .tab-content.active {
+                display: block;
+            }
+            
             .upload-area {
                 border: 3px dashed #667eea;
                 border-radius: 15px;
                 padding: 40px 20px;
-                margin: 30px 0;
+                margin: 20px 0;
                 transition: all 0.3s ease;
                 cursor: pointer;
                 background: #f8f9ff;
@@ -531,6 +697,7 @@ def index():
                 align-items: center;
                 margin-bottom: 10px;
                 flex-wrap: wrap;
+                text-align: left;
             }
             
             .config-label {
@@ -550,10 +717,89 @@ def index():
             }
             
             .config-input input[type="number"] {
-                width: 80px;
-                padding: 5px;
+                width: 100px;
+                padding: 8px;
                 border: 1px solid #ddd;
-                border-radius: 5px;
+                border-radius: 8px;
+                font-size: 0.95em;
+            }
+            
+            .config-input select {
+                width: 100px;
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                font-size: 0.95em;
+                background: white;
+            }
+            
+            .size-setting {
+                background: #f8f9ff;
+                border-radius: 15px;
+                padding: 20px;
+                margin: 20px 0;
+                border: 2px solid #e8ecff;
+            }
+            
+            .size-setting-title {
+                color: #667eea;
+                font-weight: bold;
+                margin-bottom: 15px;
+                text-align: left;
+            }
+            
+            .size-input-group {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 15px;
+                flex-wrap: wrap;
+            }
+            
+            .size-input-group label {
+                color: #555;
+                font-size: 0.95em;
+            }
+            
+            .size-input-group input {
+                width: 120px;
+                padding: 10px;
+                border: 2px solid #e8ecff;
+                border-radius: 10px;
+                font-size: 1em;
+                text-align: center;
+            }
+            
+            .size-input-group input:focus {
+                outline: none;
+                border-color: #667eea;
+            }
+            
+            .size-input-group span {
+                color: #667eea;
+                font-weight: 600;
+            }
+            
+            .compression-info {
+                margin-top: 15px;
+                padding: 15px;
+                background: #e8f4fd;
+                border-radius: 10px;
+                font-size: 0.9em;
+                color: #0c5460;
+                text-align: left;
+            }
+            
+            .compression-info strong {
+                color: #667eea;
+            }
+            
+            .preview-image {
+                max-width: 100%;
+                max-height: 200px;
+                border-radius: 10px;
+                margin: 15px 0;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.1);
             }
             
             @media (max-width: 600px) {
@@ -563,7 +809,11 @@ def index():
                 }
                 
                 h1 {
-                    font-size: 2em;
+                    font-size: 1.8em;
+                }
+                
+                .tabs {
+                    flex-direction: column;
                 }
                 
                 .config-row {
@@ -575,86 +825,153 @@ def index():
                     margin-left: 0;
                     margin-top: 5px;
                 }
+                
+                .size-input-group {
+                    flex-direction: column;
+                }
             }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>📝 Word转Markdown</h1>
-            <p style="color: #666; margin-bottom: 30px;">轻松将Word文档转换为Markdown格式</p>
+            <h1>🛠️ Little 小工具集</h1>
             
-            <div class="upload-area" id="uploadArea">
-                <div class="upload-icon">📁</div>
-                <div class="upload-text">点击或拖拽Word文档到这里</div>
-                <div style="color: #999; font-size: 0.9em;">支持 .docx 和 .doc 格式，最大16MB</div>
-                <input type="file" id="fileInput" class="file-input" accept=".docx,.doc" />
+            <div class="tabs">
+                <button class="tab active" onclick="switchTab('word')">📝 Word转Markdown</button>
+                <button class="tab" onclick="switchTab('image')">🖼️ 图片压缩</button>
             </div>
             
-            <div class="config-panel">
-                <div class="config-header" onclick="toggleConfig()">
-                    <span>⚙️ 转换设置</span>
-                    <span id="configToggle">▼</span>
+            <!-- Word转Markdown -->
+            <div id="wordTab" class="tab-content active">
+                <p style="color: #666; margin-bottom: 20px;">轻松将Word文档转换为Markdown格式</p>
+                
+                <div class="upload-area" id="wordUploadArea">
+                    <div class="upload-icon">📁</div>
+                    <div class="upload-text">点击或拖拽Word文档到这里</div>
+                    <div style="color: #999; font-size: 0.9em;">支持 .docx 和 .doc 格式，最大16MB</div>
+                    <input type="file" id="wordFileInput" class="file-input" accept=".docx,.doc" />
                 </div>
-                <div class="config-content" id="configContent">
-                    <div class="config-row">
-                        <div class="config-label">智能标题检测</div>
-                        <div class="config-input">
-                            <input type="checkbox" id="autoDetectHeaders" checked>
+                
+                <div class="config-panel">
+                    <div class="config-header" onclick="toggleConfig('word')">
+                        <span>⚙️ 转换设置</span>
+                        <span id="wordConfigToggle">▼</span>
+                    </div>
+                    <div class="config-content" id="wordConfigContent">
+                        <div class="config-row">
+                            <div class="config-label">智能标题检测</div>
+                            <div class="config-input">
+                                <input type="checkbox" id="autoDetectHeaders" checked>
+                            </div>
+                        </div>
+                        <div class="config-row">
+                            <div class="config-label">排除表格标题</div>
+                            <div class="config-input">
+                                <input type="checkbox" id="excludeTableHeaders" checked>
+                            </div>
+                        </div>
+                        <div class="config-row">
+                            <div class="config-label">元数据段落限制（前N段作为元数据）</div>
+                            <div class="config-input">
+                                <input type="number" id="metadataLimit" value="10" min="0" max="50">
+                            </div>
+                        </div>
+                        <div class="config-row">
+                            <div class="config-label">标题最小长度</div>
+                            <div class="config-input">
+                                <input type="number" id="minHeadingLength" value="2" min="1" max="20">
+                            </div>
+                        </div>
+                        <div class="config-row">
+                            <div class="config-label">标题最大长度</div>
+                            <div class="config-input">
+                                <input type="number" id="maxHeadingLength" value="80" min="10" max="200">
+                            </div>
                         </div>
                     </div>
-                    <div class="config-row">
-                        <div class="config-label">排除表格标题</div>
-                        <div class="config-input">
-                            <input type="checkbox" id="excludeTableHeaders" checked>
-                        </div>
+                </div>
+                
+                <div class="progress" id="wordProgress">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="wordProgressFill"></div>
                     </div>
-                    <div class="config-row">
-                        <div class="config-label">元数据段落限制（前N段作为元数据）</div>
-                        <div class="config-input">
-                            <input type="number" id="metadataLimit" value="10" min="0" max="50">
-                        </div>
-                    </div>
-                    <div class="config-row">
-                        <div class="config-label">标题最小长度</div>
-                        <div class="config-input">
-                            <input type="number" id="minHeadingLength" value="2" min="1" max="20">
-                        </div>
-                    </div>
-                    <div class="config-row">
-                        <div class="config-label">标题最大长度</div>
-                        <div class="config-input">
-                            <input type="number" id="maxHeadingLength" value="80" min="10" max="200">
-                        </div>
-                    </div>
+                    <div style="margin-top: 10px; color: #666;">转换中...</div>
+                </div>
+                
+                <div class="result" id="wordResult">
+                    <div id="wordResultMessage"></div>
+                    <div id="wordDownloadLink" style="margin-top: 15px;"></div>
                 </div>
             </div>
             
-            <div class="progress" id="progress">
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progressFill"></div>
+            <!-- 图片压缩 -->
+            <div id="imageTab" class="tab-content">
+                <p style="color: #666; margin-bottom: 20px;">将图片压缩到指定文件大小</p>
+                
+                <div class="upload-area" id="imageUploadArea">
+                    <div class="upload-icon">🖼️</div>
+                    <div class="upload-text">点击或拖拽图片到这里</div>
+                    <div style="color: #999; font-size: 0.9em;">支持 PNG、JPG、JPEG、GIF、WebP、BMP 格式</div>
+                    <input type="file" id="imageFileInput" class="file-input" accept=".png,.jpg,.jpeg,.gif,.webp,.bmp" />
                 </div>
-                <div style="margin-top: 10px; color: #666;">转换中...</div>
-            </div>
-            
-            <div class="result" id="result">
-                <div id="resultMessage"></div>
-                <div id="downloadLink" style="margin-top: 15px;"></div>
+                
+                <img id="imagePreview" class="preview-image" style="display: none;" />
+                
+                <div class="size-setting">
+                    <div class="size-setting-title">📐 压缩设置</div>
+                    <div class="size-input-group">
+                        <label for="targetSize">目标大小：</label>
+                        <input type="number" id="targetSize" value="500" min="1" max="10240" />
+                        <span>KB</span>
+                    </div>
+                    <div class="config-row" style="margin-top: 15px;">
+                        <div class="config-label">输出格式</div>
+                        <div class="config-input">
+                            <select id="outputFormat">
+                                <option value="JPEG" selected>JPEG</option>
+                                <option value="PNG">PNG</option>
+                                <option value="WEBP">WebP</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="compression-info" id="originalSizeInfo" style="display: none;">
+                        <strong>原图大小：</strong><span id="originalSize">-</span>
+                    </div>
+                </div>
+                
+                <div class="progress" id="imageProgress">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="imageProgressFill"></div>
+                    </div>
+                    <div style="margin-top: 10px; color: #666;">压缩中...</div>
+                </div>
+                
+                <div class="result" id="imageResult">
+                    <div id="imageResultMessage"></div>
+                    <div id="imageDownloadLink" style="margin-top: 15px;"></div>
+                </div>
             </div>
         </div>
 
         <script>
-            const uploadArea = document.getElementById('uploadArea');
-            const fileInput = document.getElementById('fileInput');
-            const progress = document.getElementById('progress');
-            const progressFill = document.getElementById('progressFill');
-            const result = document.getElementById('result');
-            const resultMessage = document.getElementById('resultMessage');
-            const downloadLink = document.getElementById('downloadLink');
+            // 标签切换
+            function switchTab(tab) {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                
+                if (tab === 'word') {
+                    document.querySelector('.tab:nth-child(1)').classList.add('active');
+                    document.getElementById('wordTab').classList.add('active');
+                } else {
+                    document.querySelector('.tab:nth-child(2)').classList.add('active');
+                    document.getElementById('imageTab').classList.add('active');
+                }
+            }
 
             // 配置面板切换
-            function toggleConfig() {
-                const content = document.getElementById('configContent');
-                const toggle = document.getElementById('configToggle');
+            function toggleConfig(type) {
+                const content = document.getElementById(type + 'ConfigContent');
+                const toggle = document.getElementById(type + 'ConfigToggle');
                 
                 if (content.classList.contains('show')) {
                     content.classList.remove('show');
@@ -665,7 +982,15 @@ def index():
                 }
             }
 
-            // 获取转换配置
+            // ========== Word转Markdown ==========
+            const wordUploadArea = document.getElementById('wordUploadArea');
+            const wordFileInput = document.getElementById('wordFileInput');
+            const wordProgress = document.getElementById('wordProgress');
+            const wordProgressFill = document.getElementById('wordProgressFill');
+            const wordResult = document.getElementById('wordResult');
+            const wordResultMessage = document.getElementById('wordResultMessage');
+            const wordDownloadLink = document.getElementById('wordDownloadLink');
+
             function getConversionConfig() {
                 return {
                     auto_detect_headers: document.getElementById('autoDetectHeaders').checked,
@@ -676,74 +1001,61 @@ def index():
                 };
             }
 
-            // 点击上传区域触发文件选择
-            uploadArea.addEventListener('click', () => {
-                fileInput.click();
-            });
-
-            // 拖拽功能
-            uploadArea.addEventListener('dragover', (e) => {
+            wordUploadArea.addEventListener('click', () => wordFileInput.click());
+            
+            wordUploadArea.addEventListener('dragover', (e) => {
                 e.preventDefault();
-                uploadArea.classList.add('dragover');
+                wordUploadArea.classList.add('dragover');
             });
 
-            uploadArea.addEventListener('dragleave', () => {
-                uploadArea.classList.remove('dragover');
+            wordUploadArea.addEventListener('dragleave', () => {
+                wordUploadArea.classList.remove('dragover');
             });
 
-            uploadArea.addEventListener('drop', (e) => {
+            wordUploadArea.addEventListener('drop', (e) => {
                 e.preventDefault();
-                uploadArea.classList.remove('dragover');
-                const files = e.dataTransfer.files;
-                if (files.length > 0) {
-                    handleFile(files[0]);
+                wordUploadArea.classList.remove('dragover');
+                if (e.dataTransfer.files.length > 0) {
+                    handleWordFile(e.dataTransfer.files[0]);
                 }
             });
 
-            // 文件选择处理
-            fileInput.addEventListener('change', (e) => {
+            wordFileInput.addEventListener('change', (e) => {
                 if (e.target.files.length > 0) {
-                    handleFile(e.target.files[0]);
+                    handleWordFile(e.target.files[0]);
                 }
             });
 
-            function handleFile(file) {
-                // 检查文件类型
+            function handleWordFile(file) {
                 if (!file.name.endsWith('.docx') && !file.name.endsWith('.doc')) {
-                    showResult('error', '请选择Word文档文件 (.docx 或 .doc)');
+                    showWordResult('error', '请选择Word文档文件 (.docx 或 .doc)');
                     return;
                 }
-
-                // 检查文件大小 (16MB)
                 if (file.size > 16 * 1024 * 1024) {
-                    showResult('error', '文件大小超过16MB限制');
+                    showWordResult('error', '文件大小超过16MB限制');
                     return;
                 }
-
-                uploadFile(file);
+                uploadWordFile(file);
             }
 
-            function uploadFile(file) {
+            function uploadWordFile(file) {
                 const formData = new FormData();
                 formData.append('file', file);
                 
-                // 添加配置参数
                 const config = getConversionConfig();
                 for (const [key, value] of Object.entries(config)) {
                     formData.append(key, value);
                 }
 
-                // 显示进度条
-                progress.style.display = 'block';
-                result.style.display = 'none';
-                progressFill.style.width = '0%';
+                wordProgress.style.display = 'block';
+                wordResult.style.display = 'none';
+                wordProgressFill.style.width = '0%';
 
-                // 模拟进度
                 let progressValue = 0;
                 const progressInterval = setInterval(() => {
                     progressValue += Math.random() * 20;
                     if (progressValue > 90) progressValue = 90;
-                    progressFill.style.width = progressValue + '%';
+                    wordProgressFill.style.width = progressValue + '%';
                 }, 100);
 
                 fetch('/convert', {
@@ -752,7 +1064,7 @@ def index():
                 })
                 .then(response => {
                     clearInterval(progressInterval);
-                    progressFill.style.width = '100%';
+                    wordProgressFill.style.width = '100%';
                     
                     if (response.ok) {
                         return response.blob();
@@ -761,32 +1073,202 @@ def index():
                     }
                 })
                 .then(blob => {
-                    // 成功，提供下载链接
                     const url = window.URL.createObjectURL(blob);
                     const filename = file.name.replace(/\\.(docx?|doc)$/i, '.md');
                     
-                    showResult('success', '转换成功！');
-                    downloadLink.innerHTML = `<a href="${url}" download="${filename}" class="btn">📥 下载Markdown文件</a>`;
+                    showWordResult('success', '转换成功！');
+                    wordDownloadLink.innerHTML = `<a href="${url}" download="${filename}" class="btn">📥 下载Markdown文件</a>`;
                     
                     setTimeout(() => {
-                        progress.style.display = 'none';
+                        wordProgress.style.display = 'none';
                     }, 500);
                 })
                 .catch(error => {
                     clearInterval(progressInterval);
-                    progress.style.display = 'none';
-                    showResult('error', error.message || '转换失败，请重试');
+                    wordProgress.style.display = 'none';
+                    showWordResult('error', error.message || '转换失败，请重试');
                 });
             }
 
-            function showResult(type, message) {
-                result.className = `result ${type}`;
-                result.style.display = 'block';
-                resultMessage.textContent = message;
+            function showWordResult(type, message) {
+                wordResult.className = `result ${type}`;
+                wordResult.style.display = 'block';
+                wordResultMessage.textContent = message;
                 if (type === 'error') {
-                    downloadLink.innerHTML = '';
+                    wordDownloadLink.innerHTML = '';
                 }
             }
+
+            // ========== 图片压缩 ==========
+            const imageUploadArea = document.getElementById('imageUploadArea');
+            const imageFileInput = document.getElementById('imageFileInput');
+            const imageProgress = document.getElementById('imageProgress');
+            const imageProgressFill = document.getElementById('imageProgressFill');
+            const imageResult = document.getElementById('imageResult');
+            const imageResultMessage = document.getElementById('imageResultMessage');
+            const imageDownloadLink = document.getElementById('imageDownloadLink');
+            const imagePreview = document.getElementById('imagePreview');
+            const originalSizeInfo = document.getElementById('originalSizeInfo');
+            const originalSizeSpan = document.getElementById('originalSize');
+
+            let selectedImageFile = null;
+
+            imageUploadArea.addEventListener('click', () => imageFileInput.click());
+
+            imageUploadArea.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                imageUploadArea.classList.add('dragover');
+            });
+
+            imageUploadArea.addEventListener('dragleave', () => {
+                imageUploadArea.classList.remove('dragover');
+            });
+
+            imageUploadArea.addEventListener('drop', (e) => {
+                e.preventDefault();
+                imageUploadArea.classList.remove('dragover');
+                if (e.dataTransfer.files.length > 0) {
+                    handleImageFile(e.dataTransfer.files[0]);
+                }
+            });
+
+            imageFileInput.addEventListener('change', (e) => {
+                if (e.target.files.length > 0) {
+                    handleImageFile(e.target.files[0]);
+                }
+            });
+
+            function formatFileSize(bytes) {
+                if (bytes < 1024) return bytes + ' B';
+                if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+                return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+            }
+
+            function handleImageFile(file) {
+                const validExtensions = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'];
+                const ext = file.name.split('.').pop().toLowerCase();
+                
+                if (!validExtensions.includes(ext)) {
+                    showImageResult('error', '请选择有效的图片文件');
+                    return;
+                }
+                
+                if (file.size > 16 * 1024 * 1024) {
+                    showImageResult('error', '文件大小超过16MB限制');
+                    return;
+                }
+
+                selectedImageFile = file;
+                
+                // 显示预览
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    imagePreview.src = e.target.result;
+                    imagePreview.style.display = 'block';
+                };
+                reader.readAsDataURL(file);
+                
+                // 显示原图大小
+                originalSizeSpan.textContent = formatFileSize(file.size);
+                originalSizeInfo.style.display = 'block';
+                
+                // 清除之前的结果
+                imageResult.style.display = 'none';
+                imageDownloadLink.innerHTML = '';
+                
+                // 自动开始压缩
+                compressImage();
+            }
+
+            function compressImage() {
+                if (!selectedImageFile) {
+                    showImageResult('error', '请先选择图片');
+                    return;
+                }
+
+                const targetSize = document.getElementById('targetSize').value;
+                const outputFormat = document.getElementById('outputFormat').value;
+
+                const formData = new FormData();
+                formData.append('file', selectedImageFile);
+                formData.append('target_size', targetSize);
+                formData.append('output_format', outputFormat);
+
+                imageProgress.style.display = 'block';
+                imageResult.style.display = 'none';
+                imageProgressFill.style.width = '0%';
+
+                let progressValue = 0;
+                const progressInterval = setInterval(() => {
+                    progressValue += Math.random() * 15;
+                    if (progressValue > 90) progressValue = 90;
+                    imageProgressFill.style.width = progressValue + '%';
+                }, 100);
+
+                fetch('/compress-image', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => {
+                    clearInterval(progressInterval);
+                    imageProgressFill.style.width = '100%';
+                    
+                    if (response.ok) {
+                        const compressedSize = response.headers.get('X-Compressed-Size');
+                        const quality = response.headers.get('X-Compression-Quality');
+                        const resized = response.headers.get('X-Image-Resized');
+                        
+                        return response.blob().then(blob => ({
+                            blob,
+                            compressedSize,
+                            quality,
+                            resized
+                        }));
+                    } else {
+                        return response.json().then(err => Promise.reject(err));
+                    }
+                })
+                .then(({blob, compressedSize, quality, resized}) => {
+                    const url = window.URL.createObjectURL(blob);
+                    const ext = outputFormat.toLowerCase() === 'jpeg' ? 'jpg' : outputFormat.toLowerCase();
+                    const baseName = selectedImageFile.name.replace(/\\.[^.]+$/, '');
+                    const filename = `${baseName}_compressed.${ext}`;
+                    
+                    let message = `压缩成功！压缩后大小：${formatFileSize(parseInt(compressedSize))}`;
+                    if (resized === 'true') {
+                        message += '（已自动调整尺寸）';
+                    }
+                    
+                    showImageResult('success', message);
+                    imageDownloadLink.innerHTML = `<a href="${url}" download="${filename}" class="btn">📥 下载压缩后的图片</a>`;
+                    
+                    setTimeout(() => {
+                        imageProgress.style.display = 'none';
+                    }, 500);
+                })
+                .catch(error => {
+                    clearInterval(progressInterval);
+                    imageProgress.style.display = 'none';
+                    showImageResult('error', error.message || '压缩失败，请重试');
+                });
+            }
+
+            function showImageResult(type, message) {
+                imageResult.className = `result ${type}`;
+                imageResult.style.display = 'block';
+                imageResultMessage.textContent = message;
+                if (type === 'error') {
+                    imageDownloadLink.innerHTML = '';
+                }
+            }
+
+            // 目标大小或格式改变时重新压缩
+            document.getElementById('targetSize').addEventListener('change', () => {
+                if (selectedImageFile) compressImage();
+            });
+            document.getElementById('outputFormat').addEventListener('change', () => {
+                if (selectedImageFile) compressImage();
+            });
         </script>
     </body>
     </html>
@@ -855,10 +1337,86 @@ def convert_word_to_markdown():
         return jsonify({'error': f'处理请求时出现错误: {str(e)}'}), 500
 
 
+@app.route('/compress-image', methods=['POST'])
+def compress_image():
+    """压缩图片到指定大小"""
+    try:
+        # 检查是否有文件上传
+        if 'file' not in request.files:
+            return jsonify({'error': '没有选择文件'}), 400
+        
+        file = request.files['file']
+        
+        # 检查文件名
+        if file.filename == '':
+            return jsonify({'error': '没有选择文件'}), 400
+        
+        # 检查文件类型
+        if not allowed_image_file(file.filename):
+            return jsonify({'error': '不支持的图片格式，请选择 PNG、JPG、JPEG、GIF、WebP 或 BMP 格式'}), 400
+        
+        # 获取目标大小（KB）
+        target_size_kb = request.form.get('target_size', type=int, default=500)
+        if target_size_kb < 1:
+            return jsonify({'error': '目标大小必须大于 0'}), 400
+        if target_size_kb > 10240:  # 最大 10MB
+            return jsonify({'error': '目标大小不能超过 10MB'}), 400
+        
+        # 获取输出格式
+        output_format = request.form.get('output_format', 'JPEG').upper()
+        if output_format not in ['JPEG', 'PNG', 'WEBP']:
+            output_format = 'JPEG'
+        
+        # 读取图片数据
+        image_data = file.read()
+        original_size = len(image_data)
+        
+        try:
+            # 压缩图片
+            compressed_data, final_size, quality, resized = compress_image_to_size(
+                image_data, target_size_kb, output_format
+            )
+            
+            # 确定输出文件扩展名
+            ext_map = {'JPEG': 'jpg', 'PNG': 'png', 'WEBP': 'webp'}
+            output_ext = ext_map.get(output_format, 'jpg')
+            
+            # 生成下载文件名
+            base_name = os.path.splitext(secure_filename(file.filename))[0]
+            download_filename = f"{base_name}_compressed.{output_ext}"
+            
+            # 创建临时文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{output_ext}') as temp_file:
+                temp_file.write(compressed_data)
+                temp_filepath = temp_file.name
+            
+            # 设置响应头，包含压缩信息
+            response = send_file(
+                temp_filepath,
+                as_attachment=True,
+                download_name=download_filename,
+                mimetype=f'image/{output_ext}'
+            )
+            
+            # 添加自定义响应头
+            response.headers['X-Original-Size'] = str(original_size)
+            response.headers['X-Compressed-Size'] = str(final_size)
+            response.headers['X-Compression-Quality'] = str(quality)
+            response.headers['X-Image-Resized'] = str(resized).lower()
+            
+            return response
+            
+        except Exception as e:
+            return jsonify({'error': f'压缩图片时出现错误: {str(e)}'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': f'处理请求时出现错误: {str(e)}'}), 500
+
+
 @app.route('/health')
 def health_check():
     """健康检查接口"""
-    return jsonify({'status': 'ok', 'message': 'Word转Markdown工具运行正常'})
+    return jsonify({'status': 'ok', 'message': '小工具集运行正常'})
 
 
 if __name__ == '__main__':

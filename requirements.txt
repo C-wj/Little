@@ -4,3 +4,4 @@ markdownify
 flask-cors
 Werkzeug
 python-dotenv
+Pillow

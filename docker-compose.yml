@@ -1,0 +1,19 @@
+services:
+  little-tools:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: little-tools
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./uploads:/app/uploads
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
